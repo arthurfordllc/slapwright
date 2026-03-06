@@ -1,0 +1,21 @@
+{
+  "name": "slapwright",
+  "version": "1.0.0",
+  "description": "Lightning-fast web testing CLI for AI agents",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node18 --format=esm --outfile=dist/slapwright.js --banner:js='#!/usr/bin/env node' --external:ws",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  }
+}

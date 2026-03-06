@@ -1,0 +1,23 @@
+{
+  "chromePort": 9222,
+  "baseUrl": "http://localhost:3000",
+  "defaults": {
+    "timeout": 5000,
+    "pollInterval": 300,
+    "screenshotDir": "/tmp",
+    "waitForNetworkIdle": true
+  },
+  "login": {
+    "url": "/login",
+    "email": "test@example.com",
+    "password": "your-password",
+    "otp": "123456",
+    "selectors": {
+      "email": "label:Email",
+      "password": "#password",
+      "submit": "role:button \"Sign in\"",
+      "otpInputs": "input[inputmode=\"numeric\"]",
+      "dashboard": "role:heading \"Good morning\""
+    }
+  }
+}
