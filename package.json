@@ -1,12 +1,52 @@
 {
-  "name": "slapwright",
+  "name": "@arthurfordllc/slapwright",
   "version": "1.0.0",
-  "description": "Lightning-fast web testing CLI for AI agents",
+  "description": "Lightning-fast web testing CLI for AI agents. Connect to Chrome via CDP, see the screen with one command, interact with simple tap/type/assert commands.",
   "type": "module",
+  "bin": {
+    "slapwright": "dist/slapwright.js"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "slapwright.config.example.json",
+    "LICENSE",
+    "README.md"
+  ],
   "scripts": {
     "build": "esbuild src/index.ts --bundle --platform=node --target=node18 --format=esm --outfile=dist/slapwright.js --banner:js='#!/usr/bin/env node' --external:ws",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "ai-agent",
+    "testing",
+    "cli",
+    "web-testing",
+    "cdp",
+    "chrome-devtools-protocol",
+    "llm",
+    "claude",
+    "automation",
+    "browser-testing",
+    "accessibility",
+    "ai-testing",
+    "developer-tools",
+    "typescript"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/arthurfordllc/slapwright.git"
+  },
+  "homepage": "https://github.com/arthurfordllc/slapwright",
+  "bugs": {
+    "url": "https://github.com/arthurfordllc/slapwright/issues"
+  },
+  "license": "MIT",
+  "author": "Arthur Ford, LLC",
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "ws": "^8.18.0"

@@ -1,2 +1,2 @@
 #!/bin/bash
-exec node /Users/andrewgillis/Workspaces/Slapwright/dist/slapwright.js "$@"
+exec node "$(dirname "$0")/../dist/slapwright.js" "$@"
