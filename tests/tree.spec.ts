@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildTree, type AXNode } from "../src/tree";
+import { buildTree, toFilterable, type AXNode } from "../src/tree";
 
 // Helper to create AXNode fixtures
 function axNode(overrides: Partial<AXNode>): AXNode {
@@ -504,6 +504,88 @@ describe("tree parser", () => {
       const result = buildTree(nodes);
       expect(result).toContain('@care-wheel group "Mom\'s Care Wheel"');
       expect(result).toContain('button "Guidance"');
+    });
+  });
+
+  describe("toFilterable", () => {
+    it("maps AXNode tree to FilterableNode with testID as identity", () => {
+      const nodes: AXNode[] = [
+        axNode({
+          nodeId: "1",
+          role: { type: "role", value: "WebArea" },
+          childIds: ["2"],
+        }),
+        axNode({
+          nodeId: "2",
+          role: { type: "role", value: "button" },
+          name: { type: "computedString", value: "Save" },
+          properties: [{ name: "data-testid", value: { type: "string", value: "save-btn" } }],
+          childIds: [],
+        }),
+      ];
+
+      const result = toFilterable(nodes);
+      // WebArea is collapsed, so save-btn should be promoted to root
+      expect(result.length).toBeGreaterThan(0);
+      const btn = result.find((n) => n.identity === "save-btn");
+      expect(btn).toBeDefined();
+      expect(btn!.isInteractive).toBe(true);
+    });
+
+    it("marks interactive roles correctly", () => {
+      const nodes: AXNode[] = [
+        axNode({ nodeId: "1", role: { type: "role", value: "WebArea" }, childIds: ["2", "3"] }),
+        axNode({
+          nodeId: "2",
+          role: { type: "role", value: "textbox" },
+          name: { type: "computedString", value: "Email" },
+          properties: [{ name: "data-testid", value: { type: "string", value: "email-input" } }],
+        }),
+        axNode({
+          nodeId: "3",
+          role: { type: "role", value: "heading" },
+          name: { type: "computedString", value: "Title" },
+        }),
+      ];
+
+      const result = toFilterable(nodes);
+      const input = result.find((n) => n.identity === "email-input");
+      expect(input).toBeDefined();
+      expect(input!.isInteractive).toBe(true);
+
+      // Heading is not interactive
+      const heading = result.find((n) => n.renderedLine?.includes("heading"));
+      if (heading) {
+        expect(heading.isInteractive).toBe(false);
+      }
+    });
+
+    it("preserves tree hierarchy through non-collapsed nodes", () => {
+      const nodes: AXNode[] = [
+        axNode({ nodeId: "1", role: { type: "role", value: "WebArea" }, childIds: ["2"] }),
+        axNode({
+          nodeId: "2",
+          role: { type: "role", value: "navigation" },
+          childIds: ["3"],
+        }),
+        axNode({
+          nodeId: "3",
+          role: { type: "role", value: "button" },
+          name: { type: "computedString", value: "Menu" },
+          properties: [{ name: "data-testid", value: { type: "string", value: "menu-btn" } }],
+        }),
+      ];
+
+      const result = toFilterable(nodes);
+      // WebArea collapsed → navigation at root
+      expect(result.length).toBe(1);
+      expect(result[0].renderedLine).toContain("nav");
+      expect(result[0].children.length).toBe(1);
+      expect(result[0].children[0].identity).toBe("menu-btn");
+    });
+
+    it("returns empty array for empty nodes", () => {
+      expect(toFilterable([])).toEqual([]);
     });
   });
 });

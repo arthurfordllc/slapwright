@@ -8,6 +8,8 @@
 import { EventEmitter } from "events";
 import { parseSelector, selectorToExpression } from "./selector.js";
 import type { AXNode } from "./tree.js";
+import { AdaptivePoll, FixedPoll, type PollStrategy } from "./polling.js";
+import { closestMatches } from "./fuzzy.js";
 
 // ── Types ──
 
@@ -46,6 +48,12 @@ export interface ElementRef {
 export interface FindOptions {
   timeout?: number;
   pollInterval?: number;
+  pollStrategy?: PollStrategy;
+}
+
+export interface NetworkIdleOptions {
+  timeout?: number;
+  idleTime?: number;
 }
 
 export interface CDPClient {
@@ -60,6 +68,9 @@ export interface CDPClient {
   click(selector: string, opts?: FindOptions): Promise<void>;
   type(selector: string, text: string, opts?: FindOptions): Promise<void>;
   getCurrentUrl(): Promise<string>;
+  on(event: string, handler: (params: unknown) => void): void;
+  off(event: string, handler: (params: unknown) => void): void;
+  waitForNetworkIdle(opts?: NetworkIdleOptions): Promise<void>;
 }
 
 // ── Errors ──
@@ -72,8 +83,15 @@ export class CDPError extends Error {
 }
 
 export class ElementNotFoundError extends CDPError {
-  constructor(selector: string) {
-    super(`Element not found: "${selector}" — timed out waiting`);
+  constructor(selector: string, suggestions?: string[], visibleIds?: string[]) {
+    let msg = `Element not found: "${selector}" — timed out waiting`;
+    if (suggestions && suggestions.length > 0) {
+      msg += `\n  did you mean: ${suggestions.join(", ")}`;
+    }
+    if (visibleIds && visibleIds.length > 0) {
+      msg += `\n  visible: ${visibleIds.join(", ")}`;
+    }
+    super(msg);
     this.name = "ElementNotFoundError";
   }
 }
@@ -238,10 +256,13 @@ export function createCDP(config: CDPConfig): CDPClient {
   }
 
   async function findElement(selector: string, opts: FindOptions = {}): Promise<ElementRef> {
-    const { timeout = 5000, pollInterval = 300 } = opts;
+    const { timeout = 5000 } = opts;
+    const poller: PollStrategy = opts.pollStrategy
+      ?? (opts.pollInterval != null ? new FixedPoll(opts.pollInterval) : new AdaptivePoll());
     const parsed = parseSelector(selector);
     const expression = selectorToExpression(parsed);
 
+    poller.reset();
     const start = Date.now();
     while (Date.now() - start < timeout) {
       const result = await send("Runtime.evaluate", {
@@ -268,10 +289,25 @@ export function createCDP(config: CDPConfig): CDPClient {
         };
       }
 
-      await sleep(pollInterval);
+      await sleep(poller.nextDelay());
     }
 
-    throw new ElementNotFoundError(selector);
+    // Gather visible testIDs for error context
+    let suggestions: string[] | undefined;
+    let visibleIds: string[] | undefined;
+    try {
+      const nodes = await getAXTree();
+      visibleIds = nodes
+        .map((n) => n.properties?.find((p) => p.name === "data-testid")?.value?.value)
+        .filter((v): v is string => typeof v === "string");
+      // Extract the bare name from the selector for fuzzy matching (strip @ prefix)
+      const queryName = selector.startsWith("@") ? selector.slice(1) : selector;
+      suggestions = closestMatches(queryName, visibleIds);
+    } catch {
+      // If AX tree fetch fails, just throw without suggestions
+    }
+
+    throw new ElementNotFoundError(selector, suggestions, visibleIds);
   }
 
   async function click(selector: string, opts: FindOptions = {}): Promise<void> {
@@ -305,6 +341,56 @@ export function createCDP(config: CDPConfig): CDPClient {
     return await evaluate("window.location.href") as string;
   }
 
+  async function waitForNetworkIdle(opts: NetworkIdleOptions = {}): Promise<void> {
+    const { timeout = 5000, idleTime = 500 } = opts;
+    await send("Network.enable");
+
+    const pending = new Set<string>();
+
+    const onRequest = (params: unknown) => {
+      const p = params as { requestId: string };
+      pending.add(p.requestId);
+    };
+    const onResponse = (params: unknown) => {
+      const p = params as { requestId: string };
+      pending.delete(p.requestId);
+    };
+    const onFailed = (params: unknown) => {
+      const p = params as { requestId: string };
+      pending.delete(p.requestId);
+    };
+
+    addEventListener("Network.requestWillBeSent", onRequest);
+    addEventListener("Network.responseReceived", onResponse);
+    addEventListener("Network.loadingFailed", onFailed);
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const deadline = setTimeout(() => {
+          clearInterval(check);
+          resolve(); // resolve on timeout rather than reject — network "idle enough"
+        }, timeout);
+
+        let idleSince = Date.now();
+        const check = setInterval(() => {
+          if (pending.size === 0) {
+            if (Date.now() - idleSince >= idleTime) {
+              clearTimeout(deadline);
+              clearInterval(check);
+              resolve();
+            }
+          } else {
+            idleSince = Date.now();
+          }
+        }, 50);
+      });
+    } finally {
+      removeEventListener("Network.requestWillBeSent", onRequest);
+      removeEventListener("Network.responseReceived", onResponse);
+      removeEventListener("Network.loadingFailed", onFailed);
+    }
+  }
+
   return {
     connect,
     disconnect,
@@ -317,6 +403,9 @@ export function createCDP(config: CDPConfig): CDPClient {
     click,
     type: typeText,
     getCurrentUrl,
+    on: addEventListener,
+    off: removeEventListener,
+    waitForNetworkIdle,
   };
 }
 

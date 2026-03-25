@@ -287,3 +287,48 @@ export function buildTree(nodes: AXNode[]): string {
 
   return lines.join("\n");
 }
+
+// ── FilterableNode adapter ──
+
+import type { FilterableNode } from "./tree-filter.js";
+
+/** Convert CDP AXNode[] into FilterableNode[] for use with filterTree. */
+export function toFilterable(nodes: AXNode[]): FilterableNode[] {
+  if (nodes.length === 0) return [];
+
+  const nodeMap = buildNodeMap(nodes);
+  const root = buildTreeStructure(nodes[0].nodeId, nodeMap);
+  if (!root) return [];
+
+  return convertTreeNode(root);
+}
+
+/** Recursively convert TreeNode → FilterableNode[], collapsing generic wrappers. */
+function convertTreeNode(treeNode: TreeNode): FilterableNode[] {
+  const { node, children } = treeNode;
+
+  // Skip entirely (LineBreak, InlineTextBox)
+  if (shouldSkip(node)) return [];
+
+  // Collapse generic wrappers — promote children
+  if (shouldCollapse(node)) {
+    const result: FilterableNode[] = [];
+    for (const child of children) {
+      result.push(...convertTreeNode(child));
+    }
+    return result;
+  }
+
+  const role = String(node.role?.value ?? "");
+  const testId = getTestId(node);
+  const rendered = renderNode(node);
+
+  const filterable: FilterableNode = {
+    identity: testId ?? null,
+    isInteractive: INTERACTIVE_ROLES.has(role),
+    renderedLine: rendered,
+    children: children.flatMap((c) => convertTreeNode(c)),
+  };
+
+  return [filterable];
+}

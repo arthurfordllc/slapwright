@@ -9,8 +9,11 @@ import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import WebSocket from "ws";
 import { createCDP, ElementNotFoundError, type SessionStore, type SessionData, type WSLike } from "./cdp.js";
-import { buildTree } from "./tree.js";
+import { buildTree, toFilterable } from "./tree.js";
 import { ok, fail, info, formatDuration } from "./fmt.js";
+import { parseFlags } from "./args.js";
+import { filterTree, type TreeFilter, type FilterableNode } from "./tree-filter.js";
+import { diffLines, formatDiff } from "./diff.js";
 
 // ── Config Loading ──
 
@@ -356,10 +359,7 @@ async function cmdWaitUrl(cdp: CDP, pattern: string, timeout: number): Promise<v
 
 async function cmdWaitNetwork(cdp: CDP, timeout: number): Promise<void> {
   const start = Date.now();
-  // Simple approach: wait for no pending requests
-  await cdp.send("Network.enable");
-  await new Promise((r) => setTimeout(r, Math.min(timeout, 2000)));
-  await cdp.send("Network.disable");
+  await cdp.waitForNetworkIdle({ timeout, idleTime: 500 });
   console.log(ok("network idle", Date.now() - start));
 }
 
@@ -406,7 +406,37 @@ async function cmdAssertUrl(cdp: CDP, pattern: string): Promise<void> {
   }
 }
 
-async function cmdPeek(cdp: CDP, config: SlapwrightConfig): Promise<void> {
+async function cmdAssertAll(cdp: CDP, selectors: string[]): Promise<void> {
+  const results = await Promise.allSettled(
+    selectors.map((s) => cdp.findElement(s, { timeout: 500 }))
+  );
+
+  const passed: string[] = [];
+  const failed: string[] = [];
+  for (let i = 0; i < selectors.length; i++) {
+    if (results[i].status === "fulfilled") {
+      passed.push(selectors[i]);
+    } else {
+      failed.push(selectors[i]);
+    }
+  }
+
+  if (passed.length > 0) {
+    console.log(ok(`visible: ${passed.join(", ")}`));
+  }
+  if (failed.length > 0) {
+    console.log(fail(`not visible: ${failed.join(", ")}`));
+  }
+  console.log(`── ${passed.length}/${selectors.length} passed`);
+
+  if (failed.length > 0) {
+    process.exitCode = 1;
+  }
+}
+
+const LAST_TREE_PATH = "/tmp/slapwright-last-tree.txt";
+
+async function cmdPeek(cdp: CDP, config: SlapwrightConfig, filter?: TreeFilter, showDiff = false): Promise<void> {
   // Get URL, screenshot, and AX tree in parallel
   const [url, ssData, axNodes] = await Promise.all([
     cdp.getCurrentUrl(),
@@ -419,14 +449,54 @@ async function cmdPeek(cdp: CDP, config: SlapwrightConfig): Promise<void> {
   const ssPath = resolve(ssDir, `slapwright-peek-${Date.now()}.png`);
   writeFileSync(ssPath, Buffer.from(ssData, "base64"));
 
-  // Build tree
-  const tree = buildTree(axNodes);
+  // Build tree — apply filter if provided
+  let tree: string;
+  if (filter && (filter.interactive || filter.section || filter.around)) {
+    const filterable = toFilterable(axNodes);
+    const filtered = filterTree(filterable, filter);
+    tree = renderFilterable(filtered, 0);
+  } else {
+    tree = buildTree(axNodes);
+  }
 
   // Parse URL path
   const urlObj = new URL(url);
   console.log(`\n📸 ${ssPath}`);
   console.log(`PAGE: ${urlObj.pathname}\n`);
-  console.log(tree);
+
+  if (showDiff) {
+    // Compare with previous tree
+    let previousLines: string[] = [];
+    try {
+      if (existsSync(LAST_TREE_PATH)) {
+        previousLines = readFileSync(LAST_TREE_PATH, "utf-8").split("\n");
+      }
+    } catch { /* no previous tree */ }
+
+    const currentLines = tree.split("\n");
+    const diffs = diffLines(previousLines, currentLines);
+    console.log(formatDiff(diffs));
+  } else {
+    console.log(tree);
+  }
+
+  // Save current tree for future --diff comparison
+  writeFileSync(LAST_TREE_PATH, tree);
+}
+
+/** Render FilterableNode[] to indented text lines. */
+function renderFilterable(nodes: FilterableNode[], depth: number): string {
+  const lines: string[] = [];
+  for (const node of nodes) {
+    if (node.renderedLine) {
+      lines.push("  ".repeat(depth) + node.renderedLine);
+    }
+    if (node.children.length > 0) {
+      const childDepth = node.renderedLine ? depth + 1 : depth;
+      lines.push(renderFilterable(node.children, childDepth));
+    }
+  }
+  return lines.join("\n");
 }
 
 async function cmdTree(cdp: CDP): Promise<void> {
@@ -438,6 +508,7 @@ async function cmdTree(cdp: CDP): Promise<void> {
   const urlObj = new URL(url);
   console.log(`PAGE: ${urlObj.pathname}\n`);
   console.log(tree);
+  writeFileSync(LAST_TREE_PATH, tree);
 }
 
 async function cmdScreenshot(cdp: CDP, config: SlapwrightConfig, name?: string): Promise<void> {
@@ -563,6 +634,56 @@ async function cmdConsole(cdp: CDP, level: string): Promise<void> {
 function shouldShowLevel(msgLevel: string, filterLevel: string): boolean {
   const levels = ["error", "warning", "info", "debug"];
   return levels.indexOf(msgLevel) <= levels.indexOf(filterLevel);
+}
+
+async function cmdFormState(cdp: CDP): Promise<void> {
+  const formData = await cdp.evaluate(`(() => {
+    const els = document.querySelectorAll('input, select, textarea, [role="checkbox"], [role="radio"], [role="switch"], [role="combobox"]');
+    return Array.from(els).map(el => {
+      const testId = el.getAttribute('data-testid');
+      const tag = el.tagName.toLowerCase();
+      const type = el.getAttribute('type') || tag;
+      const role = el.getAttribute('role') || type;
+      const label = el.getAttribute('aria-label') || el.closest('label')?.textContent?.trim() || '';
+      const placeholder = el.getAttribute('placeholder') || '';
+      const checked = el.checked ?? el.getAttribute('aria-checked') === 'true';
+      const disabled = el.disabled ?? el.getAttribute('aria-disabled') === 'true';
+      return {
+        testId: testId || null,
+        role,
+        label,
+        value: el.value || '',
+        placeholder,
+        checked: (type === 'checkbox' || type === 'radio' || role === 'switch') ? checked : undefined,
+        disabled,
+      };
+    });
+  })()`) as Array<{
+    testId: string | null;
+    role: string;
+    label: string;
+    value: string;
+    placeholder: string;
+    checked?: boolean;
+    disabled: boolean;
+  }>;
+
+  if (!formData || formData.length === 0) {
+    console.log(info("no form elements found"));
+    return;
+  }
+
+  for (const el of formData) {
+    const id = el.testId ? `@${el.testId}` : "(no testID)";
+    let line = `${id} ${el.role}`;
+    if (el.label) line += ` "${el.label}"`;
+    if (el.value) line += ` = "${el.value}"`;
+    if (el.placeholder && !el.value) line += ` [placeholder="${el.placeholder}"]`;
+    if (el.checked !== undefined) line += el.checked ? " [checked]" : "";
+    if (el.disabled) line += " (disabled)";
+    console.log(line);
+  }
+  console.log(`── ${formData.length} form element${formData.length === 1 ? "" : "s"}`);
 }
 
 async function cmdLogin(cdp: CDP, config: SlapwrightConfig, email?: string, password?: string, otp?: string): Promise<void> {
@@ -714,9 +835,18 @@ async function routeCommand(
     case "assert-url":
       if (!args[0]) throw new Error("Usage: slapwright assert-url <pattern>");
       return cmdAssertUrl(cdp, args[0]);
+    case "assert-all":
+      if (args.length === 0) throw new Error("Usage: slapwright assert-all <selector1> <selector2> ...");
+      return cmdAssertAll(cdp, args);
 
-    case "peek":
-      return cmdPeek(cdp, config);
+    case "peek": {
+      const { flags: peekFlags } = parseFlags(args, ["interactive", "section", "around", "diff"]);
+      const peekFilter: TreeFilter = {};
+      if (peekFlags.interactive) peekFilter.interactive = true;
+      if (typeof peekFlags.section === "string") peekFilter.section = peekFlags.section;
+      if (typeof peekFlags.around === "string") peekFilter.around = peekFlags.around;
+      return cmdPeek(cdp, config, peekFilter, !!peekFlags.diff);
+    }
     case "tree":
       return cmdTree(cdp);
     case "screenshot":
@@ -731,6 +861,8 @@ async function routeCommand(
       return cmdFind(cdp, args.join(" "));
     case "console":
       return cmdConsole(cdp, args[0] ?? "info");
+    case "form-state":
+      return cmdFormState(cdp);
 
     case "login":
       return cmdLogin(cdp, config, args[0], args[1], args[2]);
@@ -775,15 +907,21 @@ Assertions (exit 0 or 1):
   assert-text "<text>"       Text on page → 0
   assert-not <selector>      NOT visible → 0
   assert-url <pattern>       URL matches → 0
+  assert-all <s1> <s2> ...   Batch assert visibility
 
 Inspection:
-  peek                       Screenshot + element tree
+  peek [flags]               Screenshot + element tree
+    --interactive            Only interactive elements
+    --section <testID>       Only subtree under testID
+    --around <testID>        Target + parent + siblings
+    --diff                   Show changes since last peek
   tree                       Element tree (no screenshot)
   screenshot [name]          Screenshot only
   source                     Page HTML
   inspect <selector>         Element details
   find "<text>"              Find elements by text
   console [level]            Console messages
+  form-state                 Dump all form element values
 
 Session:
   session                    Connect to Chrome

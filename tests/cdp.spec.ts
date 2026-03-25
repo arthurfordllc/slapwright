@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createCDP, type CDPClient, type WSFactory, type SessionStore } from "../src/cdp";
 import { EventEmitter } from "events";
+import type { PollStrategy } from "../src/polling";
 
 // Mock WebSocket that simulates CDP responses
 class MockWebSocket extends EventEmitter {
@@ -375,6 +376,195 @@ describe("CDP client", () => {
       await expect(findPromise).rejects.toThrow(/not found|timeout/i);
       clearInterval(interval);
     });
+
+    it("includes fuzzy suggestions in error when testID not found", async () => {
+      const fetchMock = mockFetch("ws://localhost:9222/devtools/page/ABC");
+      const cdp = createCDP({ port: 9222, fetchFn: fetchMock, wsFactory, sessionStore: store });
+
+      const connectPromise = cdp.connect();
+      await new Promise((r) => setTimeout(r, 10));
+      await connectPromise;
+
+      const findPromise = cdp.findElement("@save-buton", { timeout: 150, pollInterval: 30 });
+
+      // Track message IDs to respond correctly
+      let lastRespondedIdx = -1;
+      const respondLoop = () => {
+        for (let idx = lastRespondedIdx + 1; idx < ws.sent.length; idx++) {
+          const msg = JSON.parse(ws.sent[idx]);
+          if (msg.method === "Runtime.evaluate") {
+            // findElement poll — respond with null
+            ws.respond(msg.id, {
+              result: { type: "object", subtype: "null", value: null },
+            });
+          } else if (msg.method === "Accessibility.getFullAXTree") {
+            // AX tree request — return nodes with testIDs
+            ws.respond(msg.id, {
+              nodes: [
+                {
+                  nodeId: "1", role: { type: "role", value: "button" },
+                  name: { type: "string", value: "Save" },
+                  properties: [{ name: "data-testid", value: { type: "string", value: "save-btn" } }],
+                },
+                {
+                  nodeId: "2", role: { type: "role", value: "button" },
+                  name: { type: "string", value: "Cancel" },
+                  properties: [{ name: "data-testid", value: { type: "string", value: "cancel-btn" } }],
+                },
+              ],
+            });
+          }
+          lastRespondedIdx = idx;
+        }
+      };
+      const interval = setInterval(respondLoop, 15);
+
+      try {
+        await findPromise;
+      } catch (err) {
+        clearInterval(interval);
+        expect(err).toBeInstanceOf(Error);
+        const msg = (err as Error).message;
+        // Should include "did you mean" with the close match
+        expect(msg).toContain("did you mean");
+        expect(msg).toContain("save-btn");
+        return;
+      }
+      clearInterval(interval);
+      throw new Error("Expected findElement to throw");
+    });
+
+    it("includes visible testIDs in error when element not found", async () => {
+      const fetchMock = mockFetch("ws://localhost:9222/devtools/page/ABC");
+      const cdp = createCDP({ port: 9222, fetchFn: fetchMock, wsFactory, sessionStore: store });
+
+      const connectPromise = cdp.connect();
+      await new Promise((r) => setTimeout(r, 10));
+      await connectPromise;
+
+      const findPromise = cdp.findElement("@nonexistent", { timeout: 150, pollInterval: 30 });
+
+      let lastRespondedIdx = -1;
+      const respondLoop = () => {
+        for (let idx = lastRespondedIdx + 1; idx < ws.sent.length; idx++) {
+          const msg = JSON.parse(ws.sent[idx]);
+          if (msg.method === "Runtime.evaluate") {
+            ws.respond(msg.id, {
+              result: { type: "object", subtype: "null", value: null },
+            });
+          } else if (msg.method === "Accessibility.getFullAXTree") {
+            ws.respond(msg.id, {
+              nodes: [
+                {
+                  nodeId: "1", role: { type: "role", value: "textbox" },
+                  properties: [{ name: "data-testid", value: { type: "string", value: "email-input" } }],
+                },
+                {
+                  nodeId: "2", role: { type: "role", value: "button" },
+                  properties: [{ name: "data-testid", value: { type: "string", value: "login-btn" } }],
+                },
+              ],
+            });
+          }
+          lastRespondedIdx = idx;
+        }
+      };
+      const interval = setInterval(respondLoop, 15);
+
+      try {
+        await findPromise;
+      } catch (err) {
+        clearInterval(interval);
+        expect(err).toBeInstanceOf(Error);
+        const msg = (err as Error).message;
+        // Should list visible testIDs
+        expect(msg).toContain("visible");
+        expect(msg).toContain("email-input");
+        expect(msg).toContain("login-btn");
+        return;
+      }
+      clearInterval(interval);
+      throw new Error("Expected findElement to throw");
+    });
+
+    it("uses custom PollStrategy for delay timing", async () => {
+      const fetchMock = mockFetch("ws://localhost:9222/devtools/page/ABC");
+      const cdp = createCDP({ port: 9222, fetchFn: fetchMock, wsFactory, sessionStore: store });
+
+      const connectPromise = cdp.connect();
+      await new Promise((r) => setTimeout(r, 10));
+      await connectPromise;
+
+      const delays: number[] = [];
+      const strategy: PollStrategy = {
+        nextDelay() {
+          delays.push(42);
+          return 42;
+        },
+        reset() {},
+      };
+
+      const findPromise = cdp.findElement("@missing", { timeout: 200, pollStrategy: strategy });
+
+      // Respond with null to every poll
+      const respondNull = () => {
+        if (ws.sent.length > 0) {
+          const sent = JSON.parse(ws.sent[ws.sent.length - 1]);
+          ws.respond(sent.id, {
+            result: { type: "object", subtype: "null", value: null },
+          });
+        }
+      };
+      const interval = setInterval(respondNull, 20);
+
+      await expect(findPromise).rejects.toThrow(/not found/i);
+      clearInterval(interval);
+
+      // Strategy was called at least once for each retry
+      expect(delays.length).toBeGreaterThan(0);
+    });
+
+    it("defaults to adaptive polling when no strategy or pollInterval given", async () => {
+      const fetchMock = mockFetch("ws://localhost:9222/devtools/page/ABC");
+      const cdp = createCDP({ port: 9222, fetchFn: fetchMock, wsFactory, sessionStore: store });
+
+      const connectPromise = cdp.connect();
+      await new Promise((r) => setTimeout(r, 10));
+      await connectPromise;
+
+      // Element found on first poll — should succeed without needing pollInterval
+      const findPromise = cdp.findElement("@save-btn", { timeout: 500 });
+      await new Promise((r) => setTimeout(r, 5));
+
+      const sent = JSON.parse(ws.sent[0]);
+      ws.respond(sent.id, {
+        result: { type: "object", objectId: "obj-adaptive", className: "HTMLButtonElement" },
+      });
+
+      const result = await findPromise;
+      expect(result).toEqual(expect.objectContaining({ objectId: "obj-adaptive" }));
+    });
+
+    it("uses FixedPoll when pollInterval is provided without pollStrategy", async () => {
+      const fetchMock = mockFetch("ws://localhost:9222/devtools/page/ABC");
+      const cdp = createCDP({ port: 9222, fetchFn: fetchMock, wsFactory, sessionStore: store });
+
+      const connectPromise = cdp.connect();
+      await new Promise((r) => setTimeout(r, 10));
+      await connectPromise;
+
+      // Pass pollInterval but no pollStrategy — should still work (backward compat)
+      const findPromise = cdp.findElement("@save-btn", { timeout: 200, pollInterval: 50 });
+      await new Promise((r) => setTimeout(r, 5));
+
+      const sent = JSON.parse(ws.sent[0]);
+      ws.respond(sent.id, {
+        result: { type: "object", objectId: "obj-fixed", className: "HTMLButtonElement" },
+      });
+
+      const result = await findPromise;
+      expect(result).toEqual(expect.objectContaining({ objectId: "obj-fixed" }));
+    });
   });
 
   describe("click", () => {
@@ -461,6 +651,101 @@ describe("CDP client", () => {
 
       const url = await urlPromise;
       expect(url).toBe("http://localhost:3000/dashboard");
+    });
+  });
+
+  describe("on/off (event subscription)", () => {
+    it("receives CDP events via on()", async () => {
+      const fetchMock = mockFetch("ws://localhost:9222/devtools/page/ABC");
+      const cdp = createCDP({ port: 9222, fetchFn: fetchMock, wsFactory, sessionStore: store });
+
+      const connectPromise = cdp.connect();
+      await new Promise((r) => setTimeout(r, 10));
+      await connectPromise;
+
+      const events: unknown[] = [];
+      cdp.on("Network.requestWillBeSent", (params) => events.push(params));
+
+      // Simulate CDP event
+      ws.event("Network.requestWillBeSent", { requestId: "1", url: "http://example.com" });
+      await new Promise((r) => setTimeout(r, 5));
+
+      expect(events.length).toBe(1);
+      expect(events[0]).toEqual({ requestId: "1", url: "http://example.com" });
+    });
+
+    it("stops receiving events after off()", async () => {
+      const fetchMock = mockFetch("ws://localhost:9222/devtools/page/ABC");
+      const cdp = createCDP({ port: 9222, fetchFn: fetchMock, wsFactory, sessionStore: store });
+
+      const connectPromise = cdp.connect();
+      await new Promise((r) => setTimeout(r, 10));
+      await connectPromise;
+
+      const events: unknown[] = [];
+      const handler = (params: unknown) => events.push(params);
+      cdp.on("Network.requestWillBeSent", handler);
+
+      ws.event("Network.requestWillBeSent", { requestId: "1" });
+      await new Promise((r) => setTimeout(r, 5));
+      expect(events.length).toBe(1);
+
+      cdp.off("Network.requestWillBeSent", handler);
+      ws.event("Network.requestWillBeSent", { requestId: "2" });
+      await new Promise((r) => setTimeout(r, 5));
+      expect(events.length).toBe(1); // no new events
+    });
+
+    it("waitForNetworkIdle resolves when no pending requests", async () => {
+      const fetchMock = mockFetch("ws://localhost:9222/devtools/page/ABC");
+      const cdp = createCDP({ port: 9222, fetchFn: fetchMock, wsFactory, sessionStore: store });
+
+      const connectPromise = cdp.connect();
+      await new Promise((r) => setTimeout(r, 10));
+      await connectPromise;
+
+      // Enable Network domain
+      const enablePromise = (async () => {
+        await new Promise((r) => setTimeout(r, 5));
+        const sent = JSON.parse(ws.sent[0]);
+        expect(sent.method).toBe("Network.enable");
+        ws.respond(sent.id, {});
+      })();
+
+      const idlePromise = cdp.waitForNetworkIdle({ timeout: 2000, idleTime: 100 });
+      await enablePromise;
+
+      // No requests fired → should resolve after idleTime
+      const result = await idlePromise;
+      expect(result).toBeUndefined(); // resolves successfully
+    });
+
+    it("waitForNetworkIdle waits for pending requests to complete", async () => {
+      const fetchMock = mockFetch("ws://localhost:9222/devtools/page/ABC");
+      const cdp = createCDP({ port: 9222, fetchFn: fetchMock, wsFactory, sessionStore: store });
+
+      const connectPromise = cdp.connect();
+      await new Promise((r) => setTimeout(r, 10));
+      await connectPromise;
+
+      // Start waitForNetworkIdle
+      const idlePromise = cdp.waitForNetworkIdle({ timeout: 2000, idleTime: 100 });
+      await new Promise((r) => setTimeout(r, 5));
+
+      // Respond to Network.enable
+      const enableMsg = JSON.parse(ws.sent[0]);
+      ws.respond(enableMsg.id, {});
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Fire a request
+      ws.event("Network.requestWillBeSent", { requestId: "req-1" });
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Complete the request
+      ws.event("Network.responseReceived", { requestId: "req-1" });
+
+      // Should resolve after idleTime passes with 0 pending
+      await idlePromise;
     });
   });
 });
