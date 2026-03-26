@@ -597,7 +597,7 @@ describe("CDP client", () => {
   });
 
   describe("type", () => {
-    it("finds element, focuses, clears, and types text", async () => {
+    it("finds element, sets value via native setter with _valueTracker reset", async () => {
       const fetchMock = mockFetch("ws://localhost:9222/devtools/page/ABC");
       const cdp = createCDP({ port: 9222, fetchFn: fetchMock, wsFactory, sessionStore: store });
 
@@ -615,19 +615,21 @@ describe("CDP client", () => {
       });
       await new Promise((r) => setTimeout(r, 10));
 
-      // focus + clear (callFunctionOn)
-      const focusMsg = JSON.parse(ws.sent[1]);
-      expect(focusMsg.method).toBe("Runtime.callFunctionOn");
-      ws.respond(focusMsg.id, { result: { type: "undefined" } });
-      await new Promise((r) => setTimeout(r, 10));
+      // callFunctionOn — sets value via native setter + resets _valueTracker + dispatches events
+      const setMsg = JSON.parse(ws.sent[1]);
+      expect(setMsg.method).toBe("Runtime.callFunctionOn");
+      expect(setMsg.params.objectId).toBe("obj-789");
+      expect(setMsg.params.arguments).toEqual([{ value: "jane@test.com" }]);
+      // Verify the function uses the native value setter pattern
+      expect(setMsg.params.functionDeclaration).toContain("nativeSetter");
+      // Verify it resets React's internal _valueTracker for reliable onChange
+      expect(setMsg.params.functionDeclaration).toContain("_valueTracker");
+      ws.respond(setMsg.id, { result: { type: "undefined" } });
 
-      // insertText
-      const typeMsg = JSON.parse(ws.sent[2]);
-      expect(typeMsg.method).toBe("Input.insertText");
-      expect(typeMsg.params.text).toBe("jane@test.com");
-      ws.respond(typeMsg.id, {});
-
+      // No Input.insertText should be sent — everything done in one callFunctionOn
       await typePromise;
+      const methods = ws.sent.map((s: string) => JSON.parse(s).method);
+      expect(methods).not.toContain("Input.insertText");
     });
   });
 

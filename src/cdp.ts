@@ -322,19 +322,27 @@ export function createCDP(config: CDPConfig): CDPClient {
   async function typeText(selector: string, text: string, opts: FindOptions = {}): Promise<void> {
     const el = await findElement(selector, opts);
 
-    // Focus and clear
+    // Set value via native setter + reset React's _valueTracker + dispatch events.
+    // This is the react-testing-library pattern — works reliably with all React
+    // controlled inputs regardless of component tree depth or batched updates.
     await send("Runtime.callFunctionOn", {
       objectId: el.objectId,
-      functionDeclaration: `function() {
+      functionDeclaration: `function(newValue) {
         this.focus();
-        this.value = '';
+        var proto = Object.getPrototypeOf(this).constructor === HTMLTextAreaElement
+          ? HTMLTextAreaElement.prototype
+          : HTMLInputElement.prototype;
+        var nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+        nativeSetter.call(this, newValue);
+        // Reset React's internal _valueTracker so it always detects the change
+        var tracker = this._valueTracker;
+        if (tracker) tracker.setValue('');
         this.dispatchEvent(new Event('input', { bubbles: true }));
+        this.dispatchEvent(new Event('change', { bubbles: true }));
       }`,
+      arguments: [{ value: text }],
       returnByValue: true,
     });
-
-    // Insert text
-    await send("Input.insertText", { text });
   }
 
   async function getCurrentUrl(): Promise<string> {
