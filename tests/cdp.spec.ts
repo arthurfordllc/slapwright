@@ -750,4 +750,120 @@ describe("CDP client", () => {
       await idlePromise;
     });
   });
+
+  /*
+   * Regression: the phantom-tap chain. A selector expression that throws used
+   * to hand findElement an exception OBJECT (type "object", has objectId),
+   * which passed the found-element checks; click() then ran this.click() on
+   * it, the inner TypeError landed in exceptionDetails, nobody looked, and
+   * the CLI printed success. Every stage must now fail loudly.
+   */
+  describe("failure honesty", () => {
+    async function connected(fetchMock = mockFetch("ws://localhost:9222/devtools/page/ABC")) {
+      const cdp = createCDP({ port: 9222, fetchFn: fetchMock, wsFactory, sessionStore: store });
+      const p = cdp.connect();
+      await new Promise((r) => setTimeout(r, 10));
+      await p;
+      return cdp;
+    }
+
+    it("findElement surfaces selector-evaluation exceptions as errors", async () => {
+      const cdp = await connected();
+      const findPromise = cdp.findElement("@boom", { timeout: 500, pollInterval: 50 });
+      await new Promise((r) => setTimeout(r, 5));
+
+      const evalMsg = JSON.parse(ws.sent[ws.sent.length - 1]);
+      ws.respond(evalMsg.id, {
+        result: { type: "object", subtype: "error", objectId: "err-obj-1", className: "SyntaxError" },
+        exceptionDetails: { text: "Uncaught SyntaxError: missing ) after argument list" },
+      });
+
+      await expect(findPromise).rejects.toThrow(/SyntaxError|evaluation failed/i);
+    });
+
+    it("findElement never returns an exception object as a found element", async () => {
+      const cdp = await connected();
+      const findPromise = cdp.findElement("@boom", { timeout: 300, pollInterval: 50 });
+
+      // Respond to every evaluate with an error-subtype object but WITHOUT
+      // exceptionDetails (defense in depth for odd CDP shapes).
+      const responder = setInterval(() => {
+        for (const raw of ws.sent) {
+          const msg = JSON.parse(raw);
+          if (msg.method === "Runtime.evaluate") {
+            ws.respond(msg.id, { result: { type: "object", subtype: "error", objectId: "err-obj-2" } });
+          }
+          if (msg.method === "Accessibility.getFullAXTree") {
+            ws.respond(msg.id, { nodes: [] });
+          }
+        }
+        ws.sent.length = 0;
+      }, 20);
+
+      try {
+        await expect(findPromise).rejects.toThrow(/not found/i);
+      } finally {
+        clearInterval(responder);
+      }
+    });
+
+    it("click surfaces callFunctionOn exceptions instead of reporting success", async () => {
+      const cdp = await connected();
+      const clickPromise = cdp.click("@real-element", { timeout: 500, pollInterval: 50 });
+      await new Promise((r) => setTimeout(r, 5));
+
+      // findElement's evaluate → return a legitimate element ref
+      const evalMsg = JSON.parse(ws.sent[ws.sent.length - 1]);
+      ws.respond(evalMsg.id, {
+        result: { type: "object", subtype: "node", objectId: "el-1", className: "HTMLDivElement" },
+      });
+      await new Promise((r) => setTimeout(r, 10));
+
+      // click's callFunctionOn → simulate a runtime exception inside the page
+      const callMsg = JSON.parse(ws.sent[ws.sent.length - 1]);
+      expect(callMsg.method).toBe("Runtime.callFunctionOn");
+      ws.respond(callMsg.id, {
+        result: { type: "undefined" },
+        exceptionDetails: { text: "Uncaught TypeError: this.click is not a function" },
+      });
+
+      await expect(clickPromise).rejects.toThrow(/this\.click is not a function|click failed/i);
+    });
+  });
+
+  describe("connect recovery", () => {
+    it("creates a page target when Chrome is alive with zero pages", async () => {
+      const calls: Array<{ url: string; init?: { method?: string } }> = [];
+      const fetchMock = vi.fn(async (url: string, init?: { method?: string }) => {
+        calls.push({ url, init });
+        if (url.endsWith("/json/new") || url.includes("/json/new?")) {
+          return { ok: true, json: async () => ({ type: "page", webSocketDebuggerUrl: "ws://localhost:9222/devtools/page/CREATED" }) };
+        }
+        return { ok: true, json: async () => [] };
+      }) as unknown as typeof fetch;
+
+      const cdp = createCDP({ port: 9222, fetchFn: fetchMock, wsFactory, sessionStore: store });
+      const p = cdp.connect();
+      await new Promise((r) => setTimeout(r, 10));
+      await p;
+
+      const createCall = calls.find((c) => c.url.includes("/json/new"));
+      expect(createCall).toBeDefined();
+      expect(createCall?.init?.method).toBe("PUT");
+      expect(wsFactory).toHaveBeenCalledWith("ws://localhost:9222/devtools/page/CREATED");
+    });
+
+    it("reports an unreachable Chrome distinctly from a page-less Chrome", async () => {
+      const deadFetch = vi.fn(async () => { throw new Error("ECONNREFUSED"); }) as unknown as typeof fetch;
+      const cdp1 = createCDP({ port: 9222, fetchFn: deadFetch, wsFactory, sessionStore: store });
+      await expect(cdp1.connect()).rejects.toThrow(/not reachable|not running/i);
+
+      const pagelessFetch = vi.fn(async (url: string) => {
+        if (url.includes("/json/new")) throw new Error("PUT refused");
+        return { ok: true, json: async () => [] };
+      }) as unknown as typeof fetch;
+      const cdp2 = createCDP({ port: 9222, fetchFn: pagelessFetch, wsFactory, sessionStore: store });
+      await expect(cdp2.connect()).rejects.toThrow(/no page targets/i);
+    });
+  });
 });

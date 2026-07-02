@@ -169,19 +169,33 @@ export function createCDP(config: CDPConfig): CDPClient {
     }
 
     // Discover via HTTP — get page target (not browser-level)
-    let wsUrl: string;
+    let targets: Array<{ type: string; webSocketDebuggerUrl: string }>;
     try {
       const resp = await fetchFn(`http://localhost:${port}/json`);
-      const targets = await resp.json() as Array<{ type: string; webSocketDebuggerUrl: string }>;
-      const page = targets.find(t => t.type === "page");
-      if (!page) {
-        throw new Error("No page targets found");
-      }
-      wsUrl = page.webSocketDebuggerUrl;
+      targets = await resp.json() as Array<{ type: string; webSocketDebuggerUrl: string }>;
     } catch (err) {
-      if (err instanceof CDPError) throw err;
-      throw new CDPError(`Chrome not running on port ${port}. Start Chrome with --remote-debugging-port=${port}`);
+      const detail = err instanceof Error ? ` (${err.message})` : "";
+      throw new CDPError(
+        `Chrome not reachable on port ${port}${detail}. Start Chrome with --remote-debugging-port=${port}`,
+      );
     }
+
+    let page = targets.find(t => t.type === "page");
+    if (!page) {
+      // Chrome is alive but every debuggable tab is gone (closed or crashed).
+      // Create a fresh page target instead of failing with a misleading error.
+      try {
+        const created = await fetchFn(`http://localhost:${port}/json/new`, { method: "PUT" });
+        page = await created.json() as { type: string; webSocketDebuggerUrl: string };
+        if (!page?.webSocketDebuggerUrl) throw new Error("create returned no webSocketDebuggerUrl");
+      } catch (err) {
+        const detail = err instanceof Error ? ` (${err.message})` : "";
+        throw new CDPError(
+          `Chrome is running on port ${port} but has no page targets, and creating one failed${detail}. Open a tab manually.`,
+        );
+      }
+    }
+    const wsUrl = page.webSocketDebuggerUrl;
 
     ws = wsFactory(wsUrl);
     await waitForOpen(ws);
@@ -275,12 +289,24 @@ export function createCDP(config: CDPConfig): CDPClient {
           objectId?: string;
           className?: string;
           value?: unknown;
+          description?: string;
         };
+        exceptionDetails?: { text: string; exception?: { description?: string } };
       };
+
+      // A selector expression that THROWS is a tool bug, not a missing
+      // element — fail loudly instead of handing back the exception object
+      // (which type-checks like an element and produced phantom taps).
+      if (result.exceptionDetails) {
+        const detail = result.exceptionDetails.exception?.description
+          ?? result.exceptionDetails.text;
+        throw new CDPError(`Selector evaluation failed for "${selector}": ${detail}`);
+      }
 
       if (
         result.result.type === "object" &&
         result.result.subtype !== "null" &&
+        result.result.subtype !== "error" &&
         result.result.objectId
       ) {
         return {
@@ -310,13 +336,27 @@ export function createCDP(config: CDPConfig): CDPClient {
     throw new ElementNotFoundError(selector, suggestions, visibleIds);
   }
 
+  /** Throw when a callFunctionOn response carries an in-page exception. */
+  function assertNoPageException(result: unknown, action: string, selector: string): void {
+    const r = result as { exceptionDetails?: { text: string; exception?: { description?: string } } };
+    if (r?.exceptionDetails) {
+      const detail = r.exceptionDetails.exception?.description ?? r.exceptionDetails.text;
+      throw new CDPError(`${action} failed for "${selector}": ${detail}`);
+    }
+  }
+
   async function click(selector: string, opts: FindOptions = {}): Promise<void> {
     const el = await findElement(selector, opts);
-    await send("Runtime.callFunctionOn", {
+    const result = await send("Runtime.callFunctionOn", {
       objectId: el.objectId,
-      functionDeclaration: "function() { this.click(); }",
+      functionDeclaration:
+        "function() { " +
+        "if (this.scrollIntoView) this.scrollIntoView({ block: 'center', inline: 'nearest' }); " +
+        "this.click(); " +
+        "}",
       returnByValue: true,
     });
+    assertNoPageException(result, "click", selector);
   }
 
   async function typeText(selector: string, text: string, opts: FindOptions = {}): Promise<void> {
@@ -325,7 +365,7 @@ export function createCDP(config: CDPConfig): CDPClient {
     // Set value via native setter + reset React's _valueTracker + dispatch events.
     // This is the react-testing-library pattern — works reliably with all React
     // controlled inputs regardless of component tree depth or batched updates.
-    await send("Runtime.callFunctionOn", {
+    const result = await send("Runtime.callFunctionOn", {
       objectId: el.objectId,
       functionDeclaration: `function(newValue) {
         this.focus();
@@ -343,6 +383,7 @@ export function createCDP(config: CDPConfig): CDPClient {
       arguments: [{ value: text }],
       returnByValue: true,
     });
+    assertNoPageException(result, "type", selector);
   }
 
   async function getCurrentUrl(): Promise<string> {

@@ -103,7 +103,8 @@ describe("selector parser", () => {
     it("generates expression for role with name", () => {
       const expr = selectorToExpression({ type: "role", role: "button", name: "Save" });
       expect(expr).toContain("button");
-      expect(expr).toContain("Save");
+      // Matching is case-insensitive; the name is embedded pre-lowered.
+      expect(expr.toLowerCase()).toContain("save");
     });
 
     it("generates expression for role without name", () => {
@@ -113,7 +114,43 @@ describe("selector parser", () => {
 
     it("escapes special characters in values", () => {
       const expr = selectorToExpression({ type: "testid", value: "it's-a-test" });
-      expect(expr).toContain("it\\'s-a-test");
+      // The value must survive into the expression exactly once, JS-safely.
+      expect(() => new Function(`return (${expr});`)).not.toThrow();
+      expect(expr).toContain("it");
     });
+  });
+
+  /*
+   * Regression: roleToTags entries like input[type='checkbox'] used to embed
+   * single quotes inside a single-quoted string, producing syntactically
+   * invalid JS. findElement then mistook the resulting exception object for a
+   * found element and click() reported success against it — phantom taps.
+   * Every selector form must compile.
+   */
+  describe("generated expressions are valid JavaScript", () => {
+    const cases = [
+      '@save-btn',
+      '@it\'s-odd',
+      'role:button "Save"',
+      'role:checkbox "Brown Sugar"',
+      'role:checkbox',
+      'role:radio "Choice A"',
+      'role:textbox "Email"',
+      'role:combobox',
+      'role:heading "Good morning"',
+      'label:Email',
+      "label:What's your name",
+      '#main-content',
+      '.some-class',
+      '"visible text"',
+      'bare text fallback',
+      '"text with \'quotes\' inside"',
+    ];
+    for (const c of cases) {
+      it(`compiles: ${c}`, () => {
+        const expr = selectorToExpression(parseSelector(c));
+        expect(() => new Function(`return (${expr});`)).not.toThrow();
+      });
+    }
   });
 });

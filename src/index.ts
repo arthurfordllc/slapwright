@@ -105,10 +105,21 @@ async function cmdStatus(cdp: CDP): Promise<void> {
     await cdp.connect();
     const url = await cdp.getCurrentUrl();
     console.log(ok(`connected — ${url}`));
-  } catch {
-    console.log(fail("not connected"));
+  } catch (err) {
+    // Say WHY: unreachable Chrome, page-less Chrome, and a dead WebSocket
+    // are three different problems with three different fixes.
+    const msg = err instanceof Error ? err.message : String(err);
+    console.log(fail(`not connected — ${msg}`));
     process.exitCode = 1;
   }
+}
+
+/** Evaluate arbitrary JavaScript in the page and print the JSON result. */
+async function cmdEval(cdp: CDP, expression: string): Promise<void> {
+  const start = Date.now();
+  const value = await cdp.evaluate(expression);
+  console.log(JSON.stringify(value, null, 2));
+  console.log(ok("evaluated", Date.now() - start));
 }
 
 async function cmdNavigate(cdp: CDP, url: string, config: SlapwrightConfig): Promise<void> {
@@ -863,6 +874,9 @@ async function routeCommand(
       return cmdConsole(cdp, args[0] ?? "info");
     case "form-state":
       return cmdFormState(cdp);
+    case "eval":
+      if (!args[0]) throw new Error('Usage: slapwright eval "<javascript expression>"');
+      return cmdEval(cdp, args.join(" "));
 
     case "login":
       return cmdLogin(cdp, config, args[0], args[1], args[2]);
@@ -922,6 +936,7 @@ Inspection:
   find "<text>"              Find elements by text
   console [level]            Console messages
   form-state                 Dump all form element values
+  eval "<js>"                Evaluate JavaScript in the page, print JSON result
 
 Session:
   session                    Connect to Chrome

@@ -9,6 +9,11 @@
  *   .class           → querySelector
  *   "text"           → text content match
  *   bare text        → text content match (fallback)
+ *
+ * Every literal is embedded via JSON.stringify so the generated expression is
+ * always valid JavaScript regardless of quotes in values or role tag maps.
+ * (A single-quote collision here once produced invalid JS for checkbox/radio/
+ * textbox roles — see tests/selector.spec.ts "generated expressions".)
  */
 
 export type Selector =
@@ -19,8 +24,14 @@ export type Selector =
   | { type: "text"; value: string }
   | { type: "css"; value: string };
 
-function escapeForJS(s: string): string {
-  return s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+/** Embed a runtime string literal into generated JS safely. */
+function js(value: string): string {
+  return JSON.stringify(value);
+}
+
+/** Embed a CSS attribute value: [data-testid="..."] with inner quotes escaped. */
+function cssAttr(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
 export function parseSelector(input: string): Selector {
@@ -71,44 +82,58 @@ export function parseSelector(input: string): Selector {
   return { type: "text", value: trimmed };
 }
 
-export function selectorToExpression(sel: Selector): string {
-  const esc = (s: string) => escapeForJS(s);
+/**
+ * Accessible-name helper injected into role/name matching. Mirrors the parts
+ * of the accname algorithm that matter for app testing: aria-label, then
+ * aria-labelledby, then associated <label> elements (form controls whose name
+ * never appears in their own textContent — the checkbox case), then text.
+ */
+const ACC_NAME_FN =
+  "(el) => { " +
+  "const aria = el.getAttribute('aria-label'); if (aria) return aria; " +
+  "const lb = el.getAttribute('aria-labelledby'); " +
+  "if (lb) { const t = lb.split(/\\s+/).map((id) => { const n = document.getElementById(id); return n ? (n.textContent || '') : ''; }).join(' ').trim(); if (t) return t; } " +
+  "if (el.labels && el.labels.length) { const t = Array.from(el.labels).map((l) => l.textContent || '').join(' ').trim(); if (t) return t; } " +
+  "return (el.textContent || '').trim(); " +
+  "}";
 
+export function selectorToExpression(sel: Selector): string {
   switch (sel.type) {
     case "testid":
-      return `document.querySelector('[data-testid="${esc(sel.value)}"]')`;
+      return `document.querySelector(${js(`[data-testid="${cssAttr(sel.value)}"]`)})`;
 
     case "id":
-      return `document.getElementById('${esc(sel.value)}')`;
+      return `document.getElementById(${js(sel.value)})`;
 
     case "css":
-      return `document.querySelector('${esc(sel.value)}')`;
+      return `document.querySelector(${js(sel.value)})`;
 
     case "label":
-      return `document.querySelector('[aria-label="${esc(sel.value)}"]') || ` +
-        `(() => { const l = Array.from(document.querySelectorAll('label')).find(l => l.textContent?.trim() === '${esc(sel.value)}'); ` +
+      return `document.querySelector(${js(`[aria-label="${cssAttr(sel.value)}"]`)}) || ` +
+        `(() => { const l = Array.from(document.querySelectorAll('label')).find(l => (l.textContent || '').trim() === ${js(sel.value)}); ` +
         `return l ? document.getElementById(l.htmlFor) || l.querySelector('input,select,textarea') : null; })()`;
 
     case "text":
       return `(() => { ` +
-        `const clickable = ['BUTTON','A','INPUT','SELECT','TEXTAREA']; ` +
+        `const needle = ${js(sel.value.toLowerCase())}; ` +
         `const all = document.querySelectorAll('button, a, [role="button"], [role="link"], input[type="submit"]'); ` +
-        `for (const el of all) { if (el.textContent?.trim().toLowerCase().includes('${esc(sel.value.toLowerCase())}')) return el; } ` +
-        `const spans = document.querySelectorAll('*'); ` +
-        `for (const el of spans) { if (clickable.includes(el.tagName) && el.textContent?.trim().toLowerCase().includes('${esc(sel.value.toLowerCase())}')) return el; } ` +
+        `for (const el of all) { if ((el.textContent || '').trim().toLowerCase().includes(needle)) return el; } ` +
+        `const clickable = ['BUTTON','A','INPUT','SELECT','TEXTAREA']; ` +
+        `for (const el of document.querySelectorAll('*')) { if (clickable.includes(el.tagName) && (el.textContent || '').trim().toLowerCase().includes(needle)) return el; } ` +
         `return null; })()`;
 
     case "role": {
+      const combined = `[role="${cssAttr(sel.role)}"], ${roleToTags(sel.role)}`;
       if (sel.name) {
         return `(() => { ` +
-          `const els = document.querySelectorAll('[role="${esc(sel.role)}"], ${roleToTags(sel.role)}'); ` +
-          `const name = '${esc(sel.name)}'.toLowerCase(); ` +
+          `const accName = ${ACC_NAME_FN}; ` +
+          `const els = document.querySelectorAll(${js(combined)}); ` +
+          `const name = ${js(sel.name.toLowerCase())}; ` +
           `for (const el of els) { ` +
-          `const label = (el.getAttribute('aria-label') || el.textContent || '').trim().toLowerCase(); ` +
-          `if (label.includes(name)) return el; } ` +
+          `if (accName(el).trim().toLowerCase().includes(name)) return el; } ` +
           `return null; })()`;
       }
-      return `document.querySelector('[role="${esc(sel.role)}"], ${roleToTags(sel.role)}')`;
+      return `document.querySelector(${js(combined)})`;
     }
   }
 }
@@ -117,13 +142,13 @@ function roleToTags(role: string): string {
   const map: Record<string, string> = {
     button: "button",
     link: "a",
-    textbox: "input:not([type]),input[type='text'],input[type='email'],input[type='password'],input[type='search'],input[type='tel'],input[type='url'],textarea",
+    textbox: 'input:not([type]),input[type="text"],input[type="email"],input[type="password"],input[type="search"],input[type="tel"],input[type="url"],textarea',
     heading: "h1,h2,h3,h4,h5,h6",
-    checkbox: "input[type='checkbox']",
-    radio: "input[type='radio']",
+    checkbox: 'input[type="checkbox"]',
+    radio: 'input[type="radio"]',
     combobox: "select",
-    tab: "[role='tab']",
-    menuitem: "[role='menuitem']",
+    tab: '[role="tab"]',
+    menuitem: '[role="menuitem"]',
     img: "img",
     list: "ul,ol",
     listitem: "li",
@@ -133,5 +158,5 @@ function roleToTags(role: string): string {
     contentinfo: "footer",
     region: "section[aria-label],section[aria-labelledby]",
   };
-  return map[role] ?? `[role="${role}"]`;
+  return map[role] ?? `[role="${cssAttr(role)}"]`;
 }
