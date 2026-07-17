@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { AdaptivePoll, FixedPoll } from "../src/polling.js";
+import { AdaptivePoll, FixedPoll, pollUntil, PollTimeoutError } from "../src/polling.js";
 import type { PollStrategy } from "../src/polling.js";
 
 describe("PollStrategy interface", () => {
@@ -77,5 +77,46 @@ describe("FixedPoll", () => {
     poll.nextDelay();
     poll.reset();
     expect(poll.nextDelay()).toBe(200);
+  });
+});
+
+describe("pollUntil", () => {
+  it("resolves with the value once the condition returns non-null", async () => {
+    let calls = 0;
+    const result = await pollUntil(
+      async () => (++calls >= 3 ? "ready" : null),
+      { timeout: 1000, strategy: new FixedPoll(1) },
+    );
+    expect(result).toBe("ready");
+    expect(calls).toBe(3);
+  });
+
+  it("throws PollTimeoutError carrying the description and last value on timeout", async () => {
+    await expect(
+      pollUntil(async () => null, {
+        timeout: 20,
+        strategy: new FixedPoll(5),
+        description: "OTP inputs to appear",
+      }),
+    ).rejects.toThrow(/OTP inputs to appear/);
+  });
+
+  it("treats false as not-ready but returns other falsy condition values (0, empty string) as success", async () => {
+    const zero = await pollUntil(async () => 0, { timeout: 100, strategy: new FixedPoll(1) });
+    expect(zero).toBe(0);
+    await expect(
+      pollUntil(async () => false, { timeout: 15, strategy: new FixedPoll(5) }),
+    ).rejects.toThrow(PollTimeoutError);
+  });
+
+  it("swallows condition errors while polling and surfaces the last one on timeout", async () => {
+    await expect(
+      pollUntil(
+        async () => {
+          throw new Error("evaluate exploded");
+        },
+        { timeout: 15, strategy: new FixedPoll(5), description: "thing" },
+      ),
+    ).rejects.toThrow(/evaluate exploded/);
   });
 });

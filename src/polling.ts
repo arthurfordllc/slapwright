@@ -38,3 +38,50 @@ export class FixedPoll implements PollStrategy {
 
   reset(): void {}
 }
+
+/** Thrown when pollUntil exhausts its timeout without the condition passing. */
+export class PollTimeoutError extends Error {
+  constructor(description: string, timeout: number, lastError?: Error) {
+    const cause = lastError ? ` (last error: ${lastError.message})` : "";
+    super(`Timed out after ${timeout}ms waiting for ${description}${cause}`);
+    this.name = "PollTimeoutError";
+  }
+}
+
+export interface PollUntilOptions {
+  timeout: number;
+  strategy?: PollStrategy;
+  /** Human phrase for the timeout message, e.g. "OTP inputs to appear". */
+  description?: string;
+}
+
+/**
+ * Poll an async condition until it returns something other than null,
+ * undefined, or false. Condition errors are swallowed while time remains
+ * (transient CDP evaluate failures) and surfaced in the timeout error.
+ */
+export async function pollUntil<T>(
+  condition: () => Promise<T | null | undefined | false>,
+  opts: PollUntilOptions,
+): Promise<T> {
+  const strategy = opts.strategy ?? new AdaptivePoll();
+  const description = opts.description ?? "condition";
+  const deadline = Date.now() + opts.timeout;
+  strategy.reset();
+  let lastError: Error | undefined;
+
+  for (;;) {
+    try {
+      const value = await condition();
+      if (value !== null && value !== undefined && value !== false) {
+        return value as T;
+      }
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+    }
+    if (Date.now() >= deadline) {
+      throw new PollTimeoutError(description, opts.timeout, lastError);
+    }
+    await new Promise((r) => setTimeout(r, strategy.nextDelay()));
+  }
+}

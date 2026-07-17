@@ -8,7 +8,8 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import WebSocket from "ws";
-import { createCDP, ElementNotFoundError, type SessionStore, type SessionData, type WSLike } from "./cdp.js";
+import { createCDP, CDPError, ElementNotFoundError, type SessionStore, type SessionData, type WSLike } from "./cdp.js";
+import { pollUntil } from "./polling.js";
 import { buildTree, toFilterable } from "./tree.js";
 import { ok, fail, info, formatDuration } from "./fmt.js";
 import { parseFlags } from "./args.js";
@@ -208,37 +209,58 @@ async function cmdUncheck(cdp: CDP, selector: string, config: SlapwrightConfig):
   console.log(ok(`unchecked ${selector}`, Date.now() - start));
 }
 
-async function cmdOtp(cdp: CDP, digits: string, selectorPattern: string): Promise<void> {
+async function cmdOtp(cdp: CDP, digits: string, selectorPattern: string, timeout = 10000): Promise<void> {
   const start = Date.now();
   const escaped = selectorPattern.replace(/'/g, "\\'");
+  const countExpr = `document.querySelectorAll('${escaped}').length`;
+  const readbackExpr = `Array.from(document.querySelectorAll('${escaped}')).map((i) => i.value).join('')`;
 
-  for (let i = 0; i < digits.length; i++) {
-    // Focus the i-th input
-    await cdp.send("Runtime.evaluate", {
-      expression: `(() => {
-        const inputs = Array.from(document.querySelectorAll('${escaped}'));
-        if (inputs[${i}]) {
-          inputs[${i}].focus();
-          inputs[${i}].value = '';
-        }
-      })()`,
-      returnByValue: true,
-    });
-    await new Promise((r) => setTimeout(r, 50));
+  // The OTP screen may still be rendering (dev servers lazy-compile routes) —
+  // typing before the inputs exist silently sprays keys at the previous form.
+  await pollUntil(
+    async () => ((await cdp.evaluate(countExpr)) as number) >= digits.length,
+    { timeout, description: `${digits.length} OTP inputs (${selectorPattern})` },
+  );
 
-    // Type the digit using keyboard input (triggers React events)
-    await cdp.send("Input.dispatchKeyEvent", {
-      type: "keyDown",
-      key: digits[i],
-      text: digits[i],
-    });
-    await cdp.send("Input.dispatchKeyEvent", {
-      type: "keyUp",
-      key: digits[i],
-    });
-    await new Promise((r) => setTimeout(r, 100));
+  // Two attempts: focus races (autofocus stealing, re-renders) can drop digits.
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    for (let i = 0; i < digits.length; i++) {
+      // Focus the i-th input
+      await cdp.send("Runtime.evaluate", {
+        expression: `(() => {
+          const inputs = Array.from(document.querySelectorAll('${escaped}'));
+          if (inputs[${i}]) {
+            inputs[${i}].focus();
+            inputs[${i}].value = '';
+          }
+        })()`,
+        returnByValue: true,
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Type the digit using keyboard input (triggers React events)
+      await cdp.send("Input.dispatchKeyEvent", {
+        type: "keyDown",
+        key: digits[i],
+        text: digits[i],
+      });
+      await cdp.send("Input.dispatchKeyEvent", {
+        type: "keyUp",
+        key: digits[i],
+      });
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    // Trust the DOM, not the keystrokes — read the digits back.
+    const readback = (await cdp.evaluate(readbackExpr)) as string;
+    if (readback === digits) {
+      console.log(ok(`entered OTP ${digits}`, Date.now() - start));
+      return;
+    }
+    if (attempt === 2) {
+      throw new CDPError(`OTP entry failed: inputs read back "${readback}", expected "${digits}"`);
+    }
   }
-  console.log(ok(`entered OTP ${digits}`, Date.now() - start));
 }
 
 async function cmdBack(cdp: CDP): Promise<void> {
@@ -723,20 +745,32 @@ async function cmdLogin(cdp: CDP, config: SlapwrightConfig, email?: string, pass
   await cdp.click(selectors.submit, { timeout: config.defaults.timeout, pollInterval: config.defaults.pollInterval });
   console.log(ok("submitted"));
 
-  // Wait for OTP inputs or dashboard
-  await new Promise((r) => setTimeout(r, 1000));
-
-  // Enter OTP if configured
+  // Enter OTP if configured — cmdOtp waits for the inputs to render and
+  // reads the digits back, so no blind sleep is needed here.
   if (o && selectors.otpInputs) {
     await cmdOtp(cdp, o, selectors.otpInputs);
     // Click verify button after OTP entry
     try {
       await cdp.click('role:button "Verify"', { timeout: 3000, pollInterval: 200 });
-      console.log(ok("verified OTP"));
     } catch {
       // Verify button may not exist if auto-verify is enabled
     }
-    await new Promise((r) => setTimeout(r, 1000));
+    // A click is not a verification — only report success once the OTP
+    // screen actually yields: either the URL leaves the login page (full
+    // navigation) or the inputs unmount (SPA step swap). Mid-navigation the
+    // evaluate can return undefined (execution context destroyed), so the
+    // count check must be an explicit === 0, never a falsy test.
+    const escaped = selectors.otpInputs.replace(/'/g, "\\'");
+    await pollUntil(
+      async () => {
+        const url = (await cdp.evaluate("window.location.href")) as string | undefined;
+        if (url && !url.includes(config.login.url)) return true;
+        const count = (await cdp.evaluate(`document.querySelectorAll('${escaped}').length`)) as number | undefined;
+        return count === 0;
+      },
+      { timeout: 10000, description: "the OTP screen to advance after verify" },
+    );
+    console.log(ok("verified OTP"));
   }
 
   // Wait for dashboard
